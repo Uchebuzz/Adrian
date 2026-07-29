@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,7 +27,11 @@ from adrian.anthropic_handler import (
     _flatten_anthropic_messages,
     _flatten_content,
     _gate_response,
+    _GatedAsyncMessageStreamManager,
+    _GatedMessageStreamManager,
+    _resolve_invocation_id,
     _rewrite_blocked_response,
+    _safe_snapshot,
     anthropic_invocation,
     anthropic_invocation_sync,
     build_anthropic_llm_pair,
@@ -1332,3 +1337,534 @@ class TestSyncGate:
 
         # No verdict can arrive with no live loop -> fail-closed rewrite.
         assert result.content[0].text == _BLOCKED_CONTENT
+
+
+# ------------------------------------------------------------------
+# Invocation ID resolution
+# ------------------------------------------------------------------
+
+
+_KWARGS: dict[str, Any] = {
+    "model": "m",
+    "messages": [{"role": "user", "content": "q"}],
+}
+
+
+class TestResolveInvocationId:
+    def test_returns_context_id(self) -> None:
+        token = set_invocation_id("ctx-id")
+
+        try:
+            assert _resolve_invocation_id() == "ctx-id"
+        finally:
+            token.var.reset(token)
+
+    def test_captured_wins_over_context(self) -> None:
+        """The streaming path samples the ID early; that sample takes priority."""
+        token = set_invocation_id("ctx-id")
+
+        try:
+            assert _resolve_invocation_id("captured-id") == "captured-id"
+        finally:
+            token.var.reset(token)
+
+    def test_falls_back_to_sentinel(self) -> None:
+        assert _resolve_invocation_id() == "no_invocation"
+
+    def test_logs_info_when_uncorrelated(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A developer with no invocation context is told why, at INFO."""
+        with caplog.at_level(logging.INFO, logger="adrian.anthropic"):
+            _resolve_invocation_id()
+
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelno == logging.INFO
+        assert "anthropic_invocation()" in caplog.records[0].getMessage()
+
+    def test_logs_nothing_when_correlated(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        token = set_invocation_id("ctx-id")
+
+        try:
+            with caplog.at_level(logging.INFO, logger="adrian.anthropic"):
+                _resolve_invocation_id()
+        finally:
+            token.var.reset(token)
+
+        assert caplog.records == []
+
+    async def test_emit_pair_honours_captured_id(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+
+        try:
+            await _emit_pair(
+                _make_text_response(), _KWARGS, invocation_id="captured-id"
+            )
+        finally:
+            _ah._hooks_getter = None
+            _ah._config_getter = None
+
+        assert collector.events[0].invocation_id == "captured-id"
+
+
+# ------------------------------------------------------------------
+# Streaming (messages.stream)
+# ------------------------------------------------------------------
+
+
+class _FakeMessageStream:
+    """Stand-in for ``anthropic.lib.streaming.MessageStream``.
+
+    Reproduces the one behaviour the instrumentation depends on:
+    ``get_final_message()`` calls ``self.until_done()``, so an instance-level
+    override of ``until_done`` is reached from inside it.
+    """
+
+    def __init__(self, message: Any) -> None:  # noqa: ANN401
+        self._message = message
+        self.until_done_calls = 0
+        self.closed = False
+
+    @property
+    def current_message_snapshot(self) -> Any:  # noqa: ANN401
+        return self._message
+
+    def until_done(self) -> None:
+        self.until_done_calls += 1
+
+    def get_final_message(self) -> Any:  # noqa: ANN401
+        self.until_done()
+        return self._message
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeStreamManager:
+    """Stand-in for ``MessageStreamManager``."""
+
+    def __init__(self, stream: Any) -> None:  # noqa: ANN401
+        self._stream = stream
+        self.exited = False
+
+    def __enter__(self) -> Any:  # noqa: ANN401
+        return self._stream
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.exited = True
+
+
+class _FakeAsyncMessageStream:
+    """Async counterpart to :class:`_FakeMessageStream`."""
+
+    def __init__(self, message: Any) -> None:  # noqa: ANN401
+        self._message = message
+        self.until_done_calls = 0
+        self.closed = False
+
+    @property
+    def current_message_snapshot(self) -> Any:  # noqa: ANN401
+        return self._message
+
+    async def until_done(self) -> None:
+        self.until_done_calls += 1
+
+    async def get_final_message(self) -> Any:  # noqa: ANN401
+        await self.until_done()
+        return self._message
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeAsyncStreamManager:
+    """Stand-in for ``AsyncMessageStreamManager``."""
+
+    def __init__(self, stream: Any) -> None:  # noqa: ANN401
+        self._stream = stream
+        self.exited = False
+
+    async def __aenter__(self) -> Any:  # noqa: ANN401
+        return self._stream
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        self.exited = True
+
+
+def _gated_async(
+    message: Any,  # noqa: ANN401
+    invocation_id: str | None = None,
+) -> tuple[_GatedAsyncMessageStreamManager, _FakeAsyncStreamManager]:
+    """Build a gated async manager around a fake stream carrying ``message``."""
+    inner = _FakeAsyncStreamManager(_FakeAsyncMessageStream(message))
+    return (
+        _GatedAsyncMessageStreamManager(inner, dict(_KWARGS), invocation_id),
+        inner,
+    )
+
+
+class TestSafeSnapshot:
+    def test_returns_snapshot(self) -> None:
+        message = _make_text_response()
+        assert _safe_snapshot(_FakeMessageStream(message)) is message
+
+    def test_swallows_assertion_from_unconsumed_stream(self) -> None:
+        """The real property asserts when nothing has accumulated yet."""
+
+        class _Unconsumed:
+            @property
+            def current_message_snapshot(self) -> Any:  # noqa: ANN401
+                raise AssertionError
+
+        assert _safe_snapshot(_Unconsumed()) is None
+
+
+class TestAsyncStreamGate:
+    @pytest.fixture(autouse=True)  # pyright: ignore[reportUntypedFunctionDecorator]
+    def _reset_getters(self) -> Any:  # noqa: ANN401
+        yield
+        _ah._ws_getter = None
+        _ah._config_getter = None
+        _ah._hooks_getter = None
+        _ah._handler_getter = None
+
+    async def test_get_final_message_emits_once(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+
+        manager, _ = _gated_async(_make_text_response())
+
+        async with manager as stream:
+            await stream.get_final_message()
+
+        # get_final_message() drives until_done() internally; the once-guard
+        # must keep that from emitting twice.
+        assert len(collector.events) == 1
+
+    async def test_until_done_then_get_final_message_emits_once(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+
+        manager, _ = _gated_async(_make_text_response())
+
+        async with manager as stream:
+            await stream.until_done()
+            await stream.get_final_message()
+
+        assert len(collector.events) == 1
+
+    async def test_exit_emits_audit_only_when_terminal_never_called(self) -> None:
+        """A text_stream-only consumer still leaves an audit trail."""
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+
+        manager, inner = _gated_async(_make_text_response())
+
+        async with manager:
+            pass
+
+        assert len(collector.events) == 1
+        assert inner.exited is True
+
+    async def test_captured_invocation_id_survives_context_exit(self) -> None:
+        """The ID is sampled at stream() time, not when the caller reads it."""
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+
+        async with anthropic_invocation():
+            captured = get_invocation_id()
+            manager, _ = _gated_async(_make_text_response(), captured)
+            ctx = await manager.__aenter__()
+
+        # Invocation context is gone by the time the final message is read.
+        assert get_invocation_id() is None
+        await ctx.get_final_message()
+        await manager.__aexit__(None, None, None)
+
+        assert collector.events[0].invocation_id == captured
+
+    async def test_block_halt_rewrites_tool_use(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        policy = _apply_mode(ws, pb.MODE_BLOCK, policy_m4=True)
+        config = AdrianConfig(session_id="s")
+        _wired_hooks(config)
+        _wire_gate(ws, config)
+
+        ws._tool_call_id_to_event_id["tc-1"] = "llm-evt"  # pyright: ignore[reportPrivateUsage]
+        fut = ws.register_pending("llm-evt")
+        fut.set_result(pb.Verdict(event_id="llm-evt", mad_code="M4_a", policy=policy))
+
+        manager, _ = _gated_async(_make_tool_response())
+
+        async with manager as stream:
+            message = await stream.get_final_message()
+
+        assert _block_types(message) == ["text"]
+        assert message.content[0].text == _BLOCKED_CONTENT
+        assert message.stop_reason == "end_turn"
+
+    async def test_block_allow_passes_through(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        policy = _apply_mode(ws, pb.MODE_BLOCK, policy_m4=False)
+        config = AdrianConfig(session_id="s")
+        _wired_hooks(config)
+        _wire_gate(ws, config)
+
+        ws._tool_call_id_to_event_id["tc-1"] = "llm-evt"  # pyright: ignore[reportPrivateUsage]
+        fut = ws.register_pending("llm-evt")
+        fut.set_result(pb.Verdict(event_id="llm-evt", mad_code="M4_a", policy=policy))
+
+        manager, _ = _gated_async(_make_tool_response())
+
+        async with manager as stream:
+            message = await stream.get_final_message()
+
+        assert _block_types(message) == ["tool_use"]
+        assert message.stop_reason == "tool_use"
+
+    async def test_verdict_timeout_fails_closed(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        _apply_mode(ws, pb.MODE_BLOCK, policy_m4=True)
+        config = AdrianConfig(session_id="s", block_timeout=0.05)
+        _wired_hooks(config)
+        _wire_gate(ws, config)
+
+        ws._tool_call_id_to_event_id["tc-1"] = "llm-evt"  # pyright: ignore[reportPrivateUsage]
+        ws.register_pending("llm-evt")  # never resolved -> times out
+
+        manager, _ = _gated_async(_make_tool_response())
+
+        async with manager as stream:
+            message = await stream.get_final_message()
+
+        assert message.content[0].text == _BLOCKED_CONTENT
+
+    async def test_hitl_reject_blocks(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        policy = _apply_mode(ws, pb.MODE_HITL)
+        config = AdrianConfig(session_id="s")
+        _wired_hooks(config)
+        _wire_gate(ws, config)
+
+        ws._tool_call_id_to_event_id["tc-1"] = "llm-evt"  # pyright: ignore[reportPrivateUsage]
+        fut = ws.register_pending("llm-evt")
+        verdict = pb.Verdict(event_id="llm-evt", mad_code="M4_a", policy=policy)
+        verdict.hitl.continue_execution = False
+        fut.set_result(verdict)
+
+        manager, _ = _gated_async(_make_tool_response())
+
+        async with manager as stream:
+            message = await stream.get_final_message()
+
+        assert message.content[0].text == _BLOCKED_CONTENT
+
+    async def test_hitl_approve_passes_through(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        policy = _apply_mode(ws, pb.MODE_HITL)
+        config = AdrianConfig(session_id="s")
+        _wired_hooks(config)
+        _wire_gate(ws, config)
+
+        ws._tool_call_id_to_event_id["tc-1"] = "llm-evt"  # pyright: ignore[reportPrivateUsage]
+        fut = ws.register_pending("llm-evt")
+        verdict = pb.Verdict(event_id="llm-evt", mad_code="M4_a", policy=policy)
+        verdict.hitl.continue_execution = True
+        fut.set_result(verdict)
+
+        manager, _ = _gated_async(_make_tool_response())
+
+        async with manager as stream:
+            message = await stream.get_final_message()
+
+        assert _block_types(message) == ["tool_use"]
+
+    async def test_instrumentation_failure_does_not_break_the_stream(self) -> None:
+        """A stream shape the patch cannot instrument is still usable."""
+
+        class _Odd:
+            """No get_final_message / until_done to rebind."""
+
+        inner = _FakeAsyncStreamManager(_Odd())
+        manager = _GatedAsyncMessageStreamManager(inner, dict(_KWARGS), None)
+
+        async with manager as stream:
+            assert isinstance(stream, _Odd)
+
+        assert inner.exited is True
+
+
+class TestSyncStreamGate:
+    """Sync stream tests run without a running loop so emission is blocking."""
+
+    @pytest.fixture(autouse=True)  # pyright: ignore[reportUntypedFunctionDecorator]
+    def _reset_getters(self) -> Any:  # noqa: ANN401
+        yield
+        _ah._ws_getter = None
+        _ah._config_getter = None
+        _ah._hooks_getter = None
+        _ah._handler_getter = None
+
+    def test_get_final_message_emits_once(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+        _wire_gate(None, config)
+
+        inner = _FakeStreamManager(_FakeMessageStream(_make_text_response()))
+        manager = _GatedMessageStreamManager(inner, dict(_KWARGS), None)
+
+        with manager as stream:
+            stream.get_final_message()
+
+        assert len(collector.events) == 1
+
+    def test_exit_emits_audit_only_when_terminal_never_called(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _, collector = _wired_hooks(config)
+        _wire_gate(None, config)
+
+        inner = _FakeStreamManager(_FakeMessageStream(_make_text_response()))
+        manager = _GatedMessageStreamManager(inner, dict(_KWARGS), None)
+
+        with manager:
+            pass
+
+        assert len(collector.events) == 1
+        assert inner.exited is True
+
+    def test_no_ws_loop_fails_closed_via_timeout(self) -> None:
+        ws = WebSocketClient("ws://x", "s", api_key="k")
+        _apply_mode(ws, pb.MODE_BLOCK, policy_m4=True)
+        ws._loop = None  # pyright: ignore[reportPrivateUsage] - no WS loop
+        ws._send_frame = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+
+        hooks = HookRegistry()
+        hooks.register(ws)
+        _ah._hooks_getter = lambda: hooks
+        config = AdrianConfig(session_id="s", block_timeout=0.05)
+        _wire_gate(ws, config)
+
+        inner = _FakeStreamManager(_FakeMessageStream(_make_tool_response()))
+        manager = _GatedMessageStreamManager(inner, dict(_KWARGS), None)
+
+        with manager as stream:
+            message = stream.get_final_message()
+
+        # No verdict can arrive with no live loop -> fail-closed rewrite.
+        assert message.content[0].text == _BLOCKED_CONTENT
+
+    def test_exception_inside_with_block_propagates(self) -> None:
+        config = AdrianConfig(session_id="s")
+        _wired_hooks(config)
+        _wire_gate(None, config)
+
+        inner = _FakeStreamManager(_FakeMessageStream(_make_text_response()))
+        manager = _GatedMessageStreamManager(inner, dict(_KWARGS), None)
+
+        with pytest.raises(RuntimeError, match="boom"), manager:
+            raise RuntimeError("boom")
+
+        assert inner.exited is True
+
+
+class TestPatchAnthropicStream:
+    @pytest.fixture(autouse=True)  # pyright: ignore[reportUntypedFunctionDecorator]
+    def _restore_sdk(self) -> Any:  # noqa: ANN401
+        """Save / restore the real SDK methods this test rewraps."""
+        from anthropic.resources.messages import AsyncMessages, Messages
+
+        saved = [
+            (Messages, "create", Messages.create),
+            (Messages, "stream", Messages.stream),
+            (AsyncMessages, "create", AsyncMessages.create),
+            (AsyncMessages, "stream", AsyncMessages.stream),
+        ]
+        flags = [
+            (cls, getattr(cls, "_adrian_patched", None))
+            for cls in (Messages, AsyncMessages)
+        ]
+
+        for cls, _flag in flags:
+            if hasattr(cls, "_adrian_patched"):
+                delattr(cls, "_adrian_patched")
+
+        yield
+
+        for cls, name, original in saved:
+            setattr(cls, name, original)
+
+        for cls, flag in flags:
+            if hasattr(cls, "_adrian_patched"):
+                delattr(cls, "_adrian_patched")
+            if flag is not None:
+                cls._adrian_patched = flag  # type: ignore[attr-defined]
+
+        _ah._hooks_getter = None
+        _ah._config_getter = None
+        _ah._ws_getter = None
+        _ah._handler_getter = None
+
+    def test_stream_is_wrapped_on_both_classes(self) -> None:
+        from anthropic.resources.messages import AsyncMessages, Messages
+
+        before = (Messages.stream, AsyncMessages.stream)
+        patch_anthropic(lambda: HookRegistry(), lambda: AdrianConfig(session_id="s"))
+
+        assert Messages.stream is not before[0]
+        assert AsyncMessages.stream is not before[1]
+
+    def test_stream_patch_is_idempotent(self) -> None:
+        from anthropic.resources.messages import AsyncMessages, Messages
+
+        hooks_getter: Any = lambda: HookRegistry()  # noqa: E731
+        config_getter: Any = lambda: AdrianConfig(session_id="s")  # noqa: E731
+
+        patch_anthropic(hooks_getter, config_getter)
+        after_first = (Messages.stream, AsyncMessages.stream)
+
+        patch_anthropic(hooks_getter, config_getter)
+
+        assert Messages.stream is after_first[0]
+        assert AsyncMessages.stream is after_first[1]
+
+    def test_patched_stream_wraps_the_original_result(self) -> None:
+        """The wrapper wraps whatever the original ``stream()`` returned."""
+        from anthropic.resources.messages import Messages
+
+        sentinel = _FakeStreamManager(_FakeMessageStream(_make_text_response()))
+        seen: list[dict[str, Any]] = []
+
+        def _fake_stream(_self: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            seen.append(kwargs)
+            return sentinel
+
+        # Stand in for the network call: patch_anthropic captures whatever
+        # Messages.stream is at patch time, so the wrapper calls this.
+        Messages.stream = _fake_stream  # type: ignore[method-assign, assignment]
+
+        patch_anthropic(lambda: HookRegistry(), lambda: AdrianConfig(session_id="s"))
+
+        manager = Messages.stream(MagicMock(), **_KWARGS)
+
+        assert isinstance(manager, _GatedMessageStreamManager)
+        assert seen == [_KWARGS]
+
+    def test_patched_stream_captures_invocation_id_eagerly(self) -> None:
+        from anthropic.resources.messages import Messages
+
+        Messages.stream = lambda _self, **_kw: _FakeStreamManager(  # type: ignore[method-assign, assignment]
+            _FakeMessageStream(_make_text_response())
+        )
+
+        patch_anthropic(lambda: HookRegistry(), lambda: AdrianConfig(session_id="s"))
+
+        with anthropic_invocation_sync():
+            expected = get_invocation_id()
+            manager = Messages.stream(MagicMock(), **_KWARGS)
+
+        # Sampled inside the block, so it survives the context exit.
+        assert get_invocation_id() is None
+        assert manager._state._invocation_id == expected  # pyright: ignore[reportPrivateUsage]

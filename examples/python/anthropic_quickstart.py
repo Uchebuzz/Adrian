@@ -9,7 +9,6 @@
 Run::
 
     export ANTHROPIC_API_KEY="sk-ant-..."
-    export ADRIAN_API_KEY="..."          # optional -- omit to collect locally only
     python examples/python/anthropic_quickstart.py
 """
 
@@ -76,7 +75,7 @@ async def main() -> None:
     # ------------------------------------------------------------------
     # 4. Always shut down Adrian cleanly to flush any pending events.
     # ------------------------------------------------------------------
-    await adrian.shutdown()
+    adrian.shutdown()
     print("Done.  Check your Adrian dashboard for the captured events.")
 
 

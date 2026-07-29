@@ -7,10 +7,10 @@
 """Anthropic SDK instrumentation for Adrian.
 
 Patches ``anthropic.Anthropic`` and ``anthropic.AsyncAnthropic`` so that every
-``messages.create`` call is captured as an Adrian ``PairedEvent`` and emitted
-through the hook registry.  The patch is idempotent; calling
-:func:`patch_anthropic` again after a shutdown / re-init only updates the
-internal getters, it does not re-wrap the already-patched method.
+``messages.create`` and ``messages.stream`` call is captured as an Adrian
+``PairedEvent`` and emitted through the hook registry.  The patch is idempotent;
+calling :func:`patch_anthropic` again after a shutdown / re-init only updates the
+internal getters, it does not re-wrap the already-patched methods.
 
 Usage without auto-instrumentation::
 
@@ -28,6 +28,36 @@ To group multi-turn calls under a single invocation ID::
     async with adrian.anthropic_invocation():
         r1 = await client.messages.create(...)
         r2 = await client.messages.create(...)  # same invocation_id as r1
+
+Without that wrapper each call is emitted with ``invocation_id="no_invocation"``
+and an INFO log line, because the Anthropic SDK -- unlike LangGraph, where
+``Pregel.ainvoke`` bounds a unit of work -- exposes only point requests with no
+boundary to scope an invocation to.
+
+Streaming
+---------
+
+``client.messages.stream(...)`` returns a context manager rather than a
+response, so the returned manager is wrapped and the stream's terminal methods
+are rerouted through the same emit + gate path as ``create``::
+
+    with client.messages.stream(model="...", ...) as stream:
+        for text in stream.text_stream:
+            print(text, end="")
+
+        message = stream.get_final_message()   # emitted and gated here
+
+Under ``MODE_BLOCK`` / ``MODE_HITL`` a halted ``tool_use`` block in the final
+message is rewritten to a ``[BLOCKED]`` text block exactly as in the
+non-streaming path.  Known limits:
+
+* Gating happens at ``get_final_message()`` / ``until_done()`` (and so also at
+  ``get_final_text()``, which delegates to the former).  A consumer that acts on
+  raw ``content_block_stop`` events instead is emitted for audit (on
+  context-manager exit) but not gated -- raw event iteration is planned for a
+  follow-up change.
+* A ``stream()`` call used outside a ``with`` block is not instrumented at all;
+  ``__enter__`` is the seam.
 """
 
 # pyright: reportUnknownVariableType=false
@@ -353,7 +383,45 @@ def build_anthropic_llm_pair(
 # ------------------------------------------------------------------
 
 
-async def _emit_pair(response: Any, kwargs: dict[str, Any]) -> None:
+def _resolve_invocation_id(captured: str | None = None) -> str:
+    """Resolve the invocation ID for an emitted event.
+
+    Unlike LangGraph -- where ``Pregel.ainvoke`` is a natural unit of work the
+    patch can scope an invocation to -- the Anthropic SDK exposes only point
+    requests, so an unwrapped call genuinely has no invocation to belong to.
+    Mirrors ``AdrianCallbackHandler._resolve_invocation_id``: log and fall back
+    to the sentinel rather than inventing an ID.
+
+    Args:
+        captured: Invocation ID sampled earlier, used by the streaming path
+            where the context variable may be out of scope by the time the
+            stream is consumed.  ``None`` falls back to the current context.
+
+    Returns:
+        The resolved invocation ID, or ``"no_invocation"``.
+    """
+    invocation_id = captured or get_invocation_id()
+
+    if invocation_id is None:
+        # The event is still emitted; it just cannot be correlated with the
+        # other calls in the same logical task.  INFO not WARN: nothing is
+        # dropped.
+        logger.info(
+            "Anthropic call made outside of an invocation context; event will "
+            "be emitted with invocation_id=no_invocation.  Wrap related calls "
+            "in adrian.anthropic_invocation() to correlate them."
+        )
+        return "no_invocation"
+
+    return invocation_id
+
+
+async def _emit_pair(
+    response: Any,  # noqa: ANN401
+    kwargs: dict[str, Any],
+    *,
+    invocation_id: str | None = None,
+) -> None:
     """Assemble and emit a ``PairedEvent`` for a completed ``messages.create`` call.
 
     Reads hooks / config / handler at call time so the correct state is used
@@ -370,6 +438,8 @@ async def _emit_pair(response: Any, kwargs: dict[str, Any]) -> None:
     Args:
         response: Anthropic ``Message`` response object.
         kwargs: Original ``messages.create`` keyword arguments.
+        invocation_id: Invocation ID sampled at call time; see
+            :func:`_resolve_invocation_id`.  ``None`` reads the current context.
     """
     if _hooks_getter is None or _config_getter is None:
         return
@@ -389,7 +459,7 @@ async def _emit_pair(response: Any, kwargs: dict[str, Any]) -> None:
         model_param: str = str(kwargs.get("model", "unknown"))
 
         flat_messages = _flatten_anthropic_messages(messages_param, system_param)
-        invocation_id = get_invocation_id() or "no_invocation"
+        resolved_invocation_id = _resolve_invocation_id(invocation_id)
         run_id = str(uuid4())
 
         pair = build_anthropic_llm_pair(
@@ -397,7 +467,7 @@ async def _emit_pair(response: Any, kwargs: dict[str, Any]) -> None:
             response=response,
             model=model_param,
             session_id=session_id,
-            invocation_id=invocation_id,
+            invocation_id=resolved_invocation_id,
             run_id=run_id,
         )
 
@@ -428,7 +498,12 @@ async def _emit_pair(response: Any, kwargs: dict[str, Any]) -> None:
         logger.exception("Failed to emit Anthropic paired event")
 
 
-def _schedule_emit(response: Any, kwargs: dict[str, Any]) -> None:
+def _schedule_emit(
+    response: Any,  # noqa: ANN401
+    kwargs: dict[str, Any],
+    *,
+    invocation_id: str | None = None,
+) -> None:
     """Schedule event emission from a synchronous call site.
 
     When inside a running event loop, schedules a fire-and-forget task so
@@ -438,8 +513,9 @@ def _schedule_emit(response: Any, kwargs: dict[str, Any]) -> None:
     Args:
         response: Anthropic ``Message`` response object.
         kwargs: Original ``messages.create`` keyword arguments.
+        invocation_id: Invocation ID sampled at call time, or ``None``.
     """
-    coro = _emit_pair(response, kwargs)
+    coro = _emit_pair(response, kwargs, invocation_id=invocation_id)
 
     try:
         loop = asyncio.get_running_loop()
@@ -615,7 +691,12 @@ async def _gate_response(response: Any, _kwargs: dict[str, Any]) -> Any:  # noqa
     return response
 
 
-def _emit_and_gate_sync(response: Any, kwargs: dict[str, Any]) -> Any:  # noqa: ANN401
+def _emit_and_gate_sync(
+    response: Any,  # noqa: ANN401
+    kwargs: dict[str, Any],
+    *,
+    invocation_id: str | None = None,
+) -> Any:  # noqa: ANN401
     """Emit and (under BLOCK/HITL) gate a response from a synchronous call site.
 
     The verdict futures live on the WebSocket client's event loop, so emission
@@ -636,6 +717,7 @@ def _emit_and_gate_sync(response: Any, kwargs: dict[str, Any]) -> Any:  # noqa: 
     Args:
         response: Anthropic ``Message`` response object.
         kwargs: Original ``messages.create`` keyword arguments.
+        invocation_id: Invocation ID sampled at call time, or ``None``.
 
     Returns:
         The response, rewritten in place when a tool call was (or must be,
@@ -646,12 +728,12 @@ def _emit_and_gate_sync(response: Any, kwargs: dict[str, Any]) -> Any:  # noqa: 
     # Not gating: no backend, inactive policy, or an event-loop thread we must
     # not block -- emit for audit and pass the response through unchanged.
     if ws is None or not _should_gate_sync(ws):
-        _schedule_emit(response, kwargs)
+        _schedule_emit(response, kwargs, invocation_id=invocation_id)
         return response
 
     # Gating is engaged: every path below must fail closed.
     async def _emit_then_gate() -> Any:  # noqa: ANN401
-        await _emit_pair(response, kwargs)
+        await _emit_pair(response, kwargs, invocation_id=invocation_id)
         return await _gate_response(response, kwargs)
 
     main_loop = getattr(ws, "_loop", None)
@@ -703,6 +785,210 @@ def _should_gate_sync(ws: WebSocketClient) -> bool:
 
 
 # ------------------------------------------------------------------
+# Streaming (messages.stream)
+# ------------------------------------------------------------------
+
+
+def _safe_snapshot(stream: Any) -> Any:  # noqa: ANN401
+    """Read a stream's accumulated message snapshot without raising.
+
+    ``MessageStream.current_message_snapshot`` asserts the snapshot exists, so
+    it raises for a stream that was never consumed.
+
+    Args:
+        stream: ``MessageStream`` or ``AsyncMessageStream``.
+
+    Returns:
+        The accumulated ``Message``, or ``None`` when unavailable.
+    """
+    try:
+        return stream.current_message_snapshot
+    except Exception:  # noqa: BLE001 - AssertionError when nothing accumulated
+        return None
+
+
+class _StreamGateState:
+    """Runs emit + gate exactly once for one streamed message.
+
+    ``MessageStream.get_final_message`` calls ``self.until_done()`` internally,
+    and both are instrumented, so the run is once-guarded.  The guard is safe
+    because :func:`_rewrite_blocked_response` mutates the message in place and
+    both paths hold the same snapshot object: a second call returns a message
+    that has already been gated and rewritten.
+    """
+
+    def __init__(self, kwargs: dict[str, Any], invocation_id: str | None) -> None:
+        self._kwargs = kwargs
+        self._invocation_id = invocation_id
+        self._done = False
+
+    @property
+    def done(self) -> bool:
+        """Whether emit + gate has already run for this stream."""
+        return self._done
+
+    def run_sync(self, message: Any) -> Any:  # noqa: ANN401
+        """Emit and gate ``message`` from a synchronous consumer."""
+        if self._done or message is None:
+            return message
+
+        self._done = True
+
+        return _emit_and_gate_sync(
+            message, self._kwargs, invocation_id=self._invocation_id
+        )
+
+    async def run_async(self, message: Any) -> Any:  # noqa: ANN401
+        """Emit and gate ``message`` from an asynchronous consumer."""
+        if self._done or message is None:
+            return message
+
+        self._done = True
+
+        await _emit_pair(message, self._kwargs, invocation_id=self._invocation_id)
+
+        return await _gate_response(message, self._kwargs)
+
+    def emit_audit_only_sync(self, message: Any) -> None:  # noqa: ANN401
+        """Emit without gating, for a stream consumed without a final message."""
+        if self._done or message is None:
+            return
+
+        self._done = True
+        _schedule_emit(message, self._kwargs, invocation_id=self._invocation_id)
+
+    async def emit_audit_only_async(self, message: Any) -> None:  # noqa: ANN401
+        """Async counterpart to :meth:`emit_audit_only_sync`."""
+        if self._done or message is None:
+            return
+
+        self._done = True
+        await _emit_pair(message, self._kwargs, invocation_id=self._invocation_id)
+
+
+def _instrument_sync_stream(stream: Any, state: _StreamGateState) -> None:  # noqa: ANN401
+    """Route a ``MessageStream``'s terminal methods through emit + gate.
+
+    Rebinds ``get_final_message`` / ``until_done`` as instance attributes so the
+    real SDK object is handed back to the caller untouched otherwise --
+    ``text_stream``, ``response``, ``request_id`` and ``close`` keep working.
+
+    Args:
+        stream: The ``MessageStream`` returned by the manager's ``__enter__``.
+        state: Once-guarded emit + gate runner for this stream.
+    """
+    original_final = stream.get_final_message
+    original_until = stream.until_done
+
+    def until_done() -> None:
+        original_until()
+        state.run_sync(_safe_snapshot(stream))
+
+    def get_final_message() -> Any:  # noqa: ANN401
+        # original_final() calls until_done() above, which already ran the
+        # gate; the once-guard makes this a pass-through of the gated message.
+        return state.run_sync(original_final())
+
+    stream.until_done = until_done
+    stream.get_final_message = get_final_message
+
+
+def _instrument_async_stream(stream: Any, state: _StreamGateState) -> None:  # noqa: ANN401
+    """Async counterpart to :func:`_instrument_sync_stream`."""
+    original_final = stream.get_final_message
+    original_until = stream.until_done
+
+    async def until_done() -> None:
+        await original_until()
+        await state.run_async(_safe_snapshot(stream))
+
+    async def get_final_message() -> Any:  # noqa: ANN401
+        return await state.run_async(await original_final())
+
+    stream.until_done = until_done
+    stream.get_final_message = get_final_message
+
+
+class _GatedMessageStreamManager:
+    """Wraps ``MessageStreamManager`` so the streamed message is emitted + gated.
+
+    ``client.messages.stream(...)`` returns a context manager rather than a
+    response, so the instrumentation seam is ``__enter__``: the real
+    ``MessageStream`` is handed back with its terminal methods rerouted (see
+    :func:`_instrument_sync_stream`).
+
+    ``__exit__`` is a safety net -- a consumer that only reads ``text_stream``
+    never calls a terminal method, and would otherwise leave no audit trail.
+    That emission is deliberately audit-only: by ``__exit__`` the caller has
+    already seen every block, so gating there would change nothing.
+    """
+
+    def __init__(
+        self,
+        inner: Any,  # noqa: ANN401
+        kwargs: dict[str, Any],
+        invocation_id: str | None,
+    ) -> None:
+        self._inner = inner
+        self._stream: Any = None
+        self._state = _StreamGateState(kwargs, invocation_id)
+
+    def __enter__(self) -> Any:  # noqa: ANN401
+        stream = self._inner.__enter__()
+        self._stream = stream
+
+        try:
+            _instrument_sync_stream(stream, self._state)
+        except Exception:
+            logger.exception("Failed to instrument Anthropic message stream")
+
+        return stream
+
+    def __exit__(self, *exc_info: Any) -> Any:  # noqa: ANN401
+        try:
+            if not self._state.done and self._stream is not None:
+                self._state.emit_audit_only_sync(_safe_snapshot(self._stream))
+        except Exception:
+            logger.exception("Failed to emit Anthropic stream event on exit")
+
+        return self._inner.__exit__(*exc_info)
+
+
+class _GatedAsyncMessageStreamManager:
+    """Async counterpart to :class:`_GatedMessageStreamManager`."""
+
+    def __init__(
+        self,
+        inner: Any,  # noqa: ANN401
+        kwargs: dict[str, Any],
+        invocation_id: str | None,
+    ) -> None:
+        self._inner = inner
+        self._stream: Any = None
+        self._state = _StreamGateState(kwargs, invocation_id)
+
+    async def __aenter__(self) -> Any:  # noqa: ANN401
+        stream = await self._inner.__aenter__()
+        self._stream = stream
+
+        try:
+            _instrument_async_stream(stream, self._state)
+        except Exception:
+            logger.exception("Failed to instrument Anthropic message stream")
+
+        return stream
+
+    async def __aexit__(self, *exc_info: Any) -> Any:  # noqa: ANN401
+        try:
+            if not self._state.done and self._stream is not None:
+                await self._state.emit_audit_only_async(_safe_snapshot(self._stream))
+        except Exception:
+            logger.exception("Failed to emit Anthropic stream event on exit")
+
+        return await self._inner.__aexit__(*exc_info)
+
+
+# ------------------------------------------------------------------
 # SDK patching
 # ------------------------------------------------------------------
 
@@ -715,14 +1001,16 @@ def patch_anthropic(
 ) -> None:
     """Monkey-patch ``anthropic.Anthropic`` and ``anthropic.AsyncAnthropic``.
 
-    Wraps ``messages.create`` on both the sync and async Anthropic resource
-    classes so every API call is captured as an Adrian ``PairedEvent`` and,
-    under ``MODE_BLOCK`` / ``MODE_HITL``, gated on the classifier verdict (see
-    :func:`_gate_response`).  Both the sync and async paths gate; the sync path
-    bridges onto the WebSocket loop (see :func:`_emit_and_gate_sync`).
+    Wraps ``messages.create`` and ``messages.stream`` on both the sync and async
+    Anthropic resource classes so every API call is captured as an Adrian
+    ``PairedEvent`` and, under ``MODE_BLOCK`` / ``MODE_HITL``, gated on the
+    classifier verdict (see :func:`_gate_response`).  Both the sync and async
+    paths gate; the sync path bridges onto the WebSocket loop (see
+    :func:`_emit_and_gate_sync`).  For ``stream`` the gate runs when the caller
+    asks for the final message (see :class:`_GatedMessageStreamManager`).
 
     The patch is idempotent: subsequent calls update the internal getters but
-    do not re-wrap the already-patched method.  If the ``anthropic`` package is
+    do not re-wrap the already-patched methods.  If the ``anthropic`` package is
     not installed the call is a silent no-op.
 
     This function is called automatically by :func:`~adrian.init` when
@@ -771,9 +1059,25 @@ def patch_anthropic(
                 # audit-only emission when gating isn't possible.
                 return _emit_and_gate_sync(response, kwargs)
 
+            _original_sync_stream = sync_cls.stream
+
+            def _patched_sync_stream(
+                self: Any,
+                *args: Any,
+                **kwargs: Any,  # noqa: ANN401
+            ) -> Any:  # noqa: ANN401
+                # Sampled now, not at consumption time: the caller may read the
+                # final message after leaving the anthropic_invocation() block.
+                captured = get_invocation_id()
+
+                return _GatedMessageStreamManager(
+                    _original_sync_stream(self, *args, **kwargs), kwargs, captured
+                )
+
             sync_cls.create = _patched_sync_create  # type: ignore[method-assign]
+            sync_cls.stream = _patched_sync_stream  # type: ignore[method-assign]
             sync_cls._adrian_patched = True  # type: ignore[attr-defined]
-            logger.debug("Patched anthropic.resources.Messages.create")
+            logger.debug("Patched anthropic.resources.Messages.create / stream")
     except AttributeError:
         logger.warning(
             "Could not patch anthropic.resources.Messages; "
@@ -799,9 +1103,25 @@ def patch_anthropic(
                 await _emit_pair(response, kwargs)
                 return await _gate_response(response, kwargs)
 
+            _original_async_stream = async_cls.stream
+
+            def _patched_async_stream(
+                self: Any,
+                *args: Any,
+                **kwargs: Any,  # noqa: ANN401
+            ) -> Any:  # noqa: ANN401
+                # Not async: stream() returns an async context manager without
+                # being awaited itself.
+                captured = get_invocation_id()
+
+                return _GatedAsyncMessageStreamManager(
+                    _original_async_stream(self, *args, **kwargs), kwargs, captured
+                )
+
             async_cls.create = _patched_async_create  # type: ignore[method-assign]
+            async_cls.stream = _patched_async_stream  # type: ignore[method-assign]
             async_cls._adrian_patched = True  # type: ignore[attr-defined]
-            logger.debug("Patched anthropic.resources.AsyncMessages.create")
+            logger.debug("Patched anthropic.resources.AsyncMessages.create / stream")
     except AttributeError:
         logger.warning(
             "Could not patch anthropic.resources.AsyncMessages; "
